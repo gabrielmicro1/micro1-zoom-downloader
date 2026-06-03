@@ -1,94 +1,210 @@
+from __future__ import annotations
+
 import datetime
+import importlib
 import math
 import os
+import shutil
+import sqlite3
+import sys
+import time
 import traceback
 from calendar import monthrange
-from types import ModuleType
-import sqlite3
-import time
+from dataclasses import dataclass
 
 import colorama
 from colorama import Fore, Style
 
 import utils
 from zoom_client import zoom_client
-import ssl
 
-ssl._create_default_https_context = ssl._create_unverified_context
 
-colorama.init()
+SUPPORTED_MODES = {"download", "estimate", "retry_not_ready", "delete_bulk", "delete_one"}
+DELETE_ACTIONS = {"trash", "delete"}
+DELETE_SCOPES = {"files", "meetings"}
 
-try:
-    import config as CONFIG
-except ImportError:
-    utils.print_bright_red(
-        "Missing config file, copy config_template.py to config.py and change as needed."
+
+class ConfigError(Exception):
+    pass
+
+
+@dataclass
+class RecordingItem:
+    meeting_uuid: str
+    topic: str
+    recording_id: str
+    file_type: str
+    file_size: int
+    download_url: str
+    destination_path: str
+    file_name: str
+    recording_name: str
+    recording_type: str
+    local_exists: bool
+    local_size_matches: bool
+    source_kind: str
+
+
+@dataclass
+class RecordingInventory:
+    files: list[RecordingItem]
+    meeting_count: int
+    skipped_missing_size_count: int = 0
+
+    @property
+    def total_size(self):
+        return sum(item.file_size for item in self.files)
+
+    @property
+    def already_present_size(self):
+        return sum(item.file_size for item in self.files if item.local_size_matches)
+
+    @property
+    def additional_size(self):
+        return sum(item.file_size for item in self.files if not item.local_size_matches)
+
+    @property
+    def additional_file_count(self):
+        return sum(1 for item in self.files if not item.local_size_matches)
+
+    @property
+    def meeting_uuids(self):
+        return sorted({item.meeting_uuid for item in self.files})
+
+
+@dataclass
+class SpaceStatus:
+    usage_path: str
+    free_bytes: int
+    required_bytes: int
+    additional_bytes: int
+    reserve_bytes: int
+
+    @property
+    def has_enough_space(self):
+        return self.free_bytes >= self.required_bytes
+
+
+@dataclass
+class DownloadSummary:
+    downloaded_count: int = 0
+    skipped_count: int = 0
+    failed_count: int = 0
+    downloaded_size: int = 0
+    failed_meeting_uuids: set[str] | None = None
+
+    def __post_init__(self):
+        if self.failed_meeting_uuids is None:
+            self.failed_meeting_uuids = set()
+
+
+@dataclass
+class DeleteSummary:
+    deleted_count: int = 0
+    skipped_count: int = 0
+    failed_count: int = 0
+
+
+def load_config():
+    try:
+        return importlib.import_module("config")
+    except ImportError as error:
+        raise ConfigError(
+            "Missing config file, copy config_template.py to config.py and change as needed."
+        ) from error
+
+
+def create_client(config):
+    return zoom_client(
+        account_id=config.ACCOUNT_ID,
+        client_id=config.CLIENT_ID,
+        client_secret=config.CLIENT_SECRET,
     )
 
-client = zoom_client(
-    account_id=CONFIG.ACCOUNT_ID,
-    client_id=CONFIG.CLIENT_ID,
-    client_secret=CONFIG.CLIENT_SECRET,
-)
 
-# Connect to the SQLite database (or create it if it doesn't exist)
-conn = sqlite3.connect("meetings.db")
+def resolve_mode(config):
+    if hasattr(config, "MODE"):
+        mode = config.MODE
+    elif getattr(config, "NOT_READY_FILES_ONLY", False):
+        utils.print_bright_red(
+            "NOT_READY_FILES_ONLY is deprecated; using MODE = 'retry_not_ready'."
+        )
+        mode = "retry_not_ready"
+    else:
+        mode = "download"
 
-# Create a cursor object to execute SQL queries
-cursor = conn.cursor()
+    if mode not in SUPPORTED_MODES:
+        raise ConfigError(
+            f"Unsupported MODE {mode!r}. Expected one of {sorted(SUPPORTED_MODES)}."
+        )
 
-# Create a table to store the meeting UUIDs if it doesn't exist already
-cursor.execute("""CREATE TABLE IF NOT EXISTS meetings
-                (id INTEGER PRIMARY KEY, uuid TEXT UNIQUE)""")
+    return mode
 
-# Commit the transaction
-conn.commit()
+
+def config_value(config, name, default):
+    return getattr(config, name, default)
 
 
 def main():
-    NOT_READY_FILES_ONLY = CONFIG.NOT_READY_FILES_ONLY
-
-    if NOT_READY_FILES_ONLY:
-        download_not_ready_files()
-    else:
-        CONFIG.OUTPUT_PATH = utils.prepend_path_on_windows(CONFIG.OUTPUT_PATH)
-
-        print_filter_warnings()
-
-        from_date = datetime.datetime(
-            CONFIG.START_YEAR, CONFIG.START_MONTH, CONFIG.START_DAY or 1
-        )
-        to_date = datetime.datetime(
-            CONFIG.END_YEAR,
-            CONFIG.END_MONTH,
-            CONFIG.END_DAY or monthrange(CONFIG.END_YEAR, CONFIG.END_MONTH)[1],
-        )
-
-        file_count, total_size, skipped_count = download_recordings(
-            get_users(), from_date, to_date
-        )
-
-        total_size_str = utils.size_to_string(total_size)
-
-        print(
-            f"{Style.BRIGHT}Downloaded {Fore.GREEN}{file_count}{Fore.RESET} files.",
-            f"Total size: {Fore.GREEN}{total_size_str}{Fore.RESET}.{Style.RESET_ALL}",
-            f"Skipped: {skipped_count} files.",
-        )
+    colorama.init()
+    config = load_config()
+    run(config)
 
 
-def print_filter_warnings():
+def run(config, client=None, db_path="meetings.db"):
+    mode = resolve_mode(config)
+    config.OUTPUT_PATH = utils.prepend_path_on_windows(config.OUTPUT_PATH)
+    client = client or create_client(config)
+
+    if mode == "delete_one":
+        delete_one(config, client)
+        return
+
+    conn = ensure_meetings_db(db_path)
+    try:
+        if mode == "retry_not_ready":
+            run_retry_not_ready(config, client, conn)
+            return
+
+        print_filter_warnings(config)
+        from_date, to_date = get_date_range(config)
+        inventory = build_inventory(config, client, conn, from_date, to_date)
+        print_inventory_summary(inventory)
+
+        if mode == "estimate":
+            check_destination_space(config, inventory, fail_on_shortage=False)
+            return
+
+        if mode == "download":
+            check_destination_space(
+                config,
+                inventory,
+                fail_on_shortage=config_value(config, "FAIL_IF_NOT_ENOUGH_SPACE", True),
+            )
+            summary = download_inventory(config, client, inventory)
+            print_download_summary(summary)
+            return
+
+        if mode == "delete_bulk":
+            summary = delete_inventory(config, client, inventory)
+            print_delete_summary(summary)
+            return
+    finally:
+        conn.close()
+
+
+def print_filter_warnings(config):
     did_print = False
 
-    if CONFIG.TOPICS:
-        utils.print_bright(f"Topics filter is active {CONFIG.TOPICS}")
+    if config.TOPICS:
+        utils.print_bright(f"Topics filter is active {config.TOPICS}")
         did_print = True
-    if CONFIG.USERS:
-        utils.print_bright(f"Users filter is active {CONFIG.USERS}")
+    if config.USERS:
+        utils.print_bright(f"Users filter is active {config.USERS}")
         did_print = True
-    if CONFIG.RECORDING_FILE_TYPES:
+    if config.RECORDING_FILE_TYPES:
         utils.print_bright(
-            f"Recording file types filter is active {CONFIG.RECORDING_FILE_TYPES}"
+            f"Recording file types filter is active {config.RECORDING_FILE_TYPES}"
         )
         did_print = True
 
@@ -96,24 +212,84 @@ def print_filter_warnings():
         print()
 
 
-def get_users():
-    if CONFIG.USERS:
-        return [(email, "") for email in CONFIG.USERS]
+def get_date_range(config):
+    from_date = datetime.datetime(
+        config.START_YEAR, config.START_MONTH, config.START_DAY or 1
+    )
+    to_date = datetime.datetime(
+        config.END_YEAR,
+        config.END_MONTH,
+        config.END_DAY or monthrange(config.END_YEAR, config.END_MONTH)[1],
+    )
+    return from_date, to_date
+
+
+def ensure_meetings_db(db_path):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        """CREATE TABLE IF NOT EXISTS meetings
+        (id INTEGER PRIMARY KEY, uuid TEXT UNIQUE)"""
+    )
+    conn.commit()
+    return conn
+
+
+def read_logged_meeting_uuids(conn):
+    cursor = conn.cursor()
+    cursor.execute("SELECT uuid FROM meetings")
+    return [row[0] for row in cursor.fetchall()]
+
+
+def log_meeting_uuid(conn, meeting_uuid):
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO meetings (uuid) VALUES (?)", (meeting_uuid,))
+    conn.commit()
+
+
+def clear_meeting_uuid(conn, meeting_uuid):
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM meetings WHERE uuid = ?", (meeting_uuid,))
+    conn.commit()
+
+
+def run_retry_not_ready(config, client, conn):
+    meeting_uuids = read_logged_meeting_uuids(conn)
+    if not meeting_uuids:
+        utils.print_bright("No not-ready meeting UUIDs are logged.")
+        return
+
+    meetings = get_meetings(
+        client, meeting_uuids, conn=conn, log_failures=True, clear_success=False
+    )
+    inventory = build_inventory_from_meetings(config, meetings)
+    print_inventory_summary(inventory)
+    check_destination_space(
+        config,
+        inventory,
+        fail_on_shortage=config_value(config, "FAIL_IF_NOT_ENOUGH_SPACE", True),
+    )
+    summary = download_inventory(config, client, inventory)
+
+    fetched_uuids = {meeting["_requested_uuid"] for meeting in meetings}
+    for meeting_uuid in fetched_uuids - summary.failed_meeting_uuids:
+        clear_meeting_uuid(conn, meeting_uuid)
+
+    print_download_summary(summary)
+
+
+def get_users(config, client):
+    if config.USERS:
+        return [(email, "") for email in config.USERS]
 
     utils.print_bright("Scanning for users:")
     active_users_url = "https://api.zoom.us/v2/users?status=active"
     inactive_users_url = "https://api.zoom.us/v2/users?status=inactive"
 
     users = []
-    pages = utils.chain(
-        client.paginate(active_users_url), client.paginate(inactive_users_url)
-    )
+    pages = utils.chain(client.paginate(active_users_url), client.paginate(inactive_users_url))
     for page in utils.percentage_tqdm(pages):
-        (
-            users.extend(
-                [(user["email"], get_user_name(user)) for user in page["users"]]
-            ),
-        )
+        users.extend([(user["email"], get_user_name(user)) for user in page["users"]])
 
     print()
     return users
@@ -125,77 +301,68 @@ def get_user_name(user_data):
 
     if first_name and last_name:
         return f"{first_name} {last_name}"
-    else:
-        return first_name or last_name
-
-
-def download_recordings(users, from_date, to_date):
-    file_count, total_size, skipped_count = 0, 0, 0
-
-    for user_email, user_name in users:
-        user_description = get_user_description(user_email, user_name)
-        user_host_folder = get_user_host_folder(user_email)
-
-        utils.print_bright(
-            f"Downloading recordings from user {user_description} - Starting at {date_to_str(from_date)} "
-            f"and up to {date_to_str(to_date)} (inclusive)."
-        )
-
-        meetings = get_meetings(get_meeting_uuids(user_email, from_date, to_date))
-        user_file_count, user_total_size, user_skipped_count = (
-            download_recordings_from_meetings(meetings, user_host_folder)
-        )
-
-        utils.print_bright(
-            "######################################################################"
-        )
-        print()
-
-        file_count += user_file_count
-        total_size += user_total_size
-        skipped_count += user_skipped_count
-
-    return (file_count, total_size, skipped_count)
-
-
-def download_not_ready_files():
-    conn = sqlite3.connect("meetings.db")
-
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT uuid FROM meetings")
-
-    rows = cursor.fetchall()
-
-    uuids = [row[0] for row in rows]
-
-    get_meetings(uuids)
+    return first_name or last_name
 
 
 def get_user_description(user_email, user_name):
-    return f"{user_email} ({user_name})" if (user_name) else user_email
+    return f"{user_email} ({user_name})" if user_name else user_email
 
 
-def get_user_host_folder(user_email):
-    if CONFIG.GROUP_BY_USER:
-        return os.path.join(CONFIG.OUTPUT_PATH, user_email)
-    else:
-        return CONFIG.OUTPUT_PATH
+def get_user_host_folder(config, user_email):
+    if config.GROUP_BY_USER:
+        return os.path.join(config.OUTPUT_PATH, user_email)
+    return config.OUTPUT_PATH
+
+
+def get_meeting_host_folder(config, meeting):
+    host_email = meeting.get("host_email") or meeting.get("host_id") or "unknown-user"
+    return get_user_host_folder(config, host_email)
 
 
 def date_to_str(date):
     return date.strftime("%Y-%m-%d")
 
 
-def get_meeting_uuids(user_email, start_date, end_date):
-    meeting_uuids = []
+def build_inventory(config, client, conn, from_date, to_date):
+    all_files = []
+    meeting_count = 0
+    skipped_missing_size_count = 0
 
+    for user_email, user_name in get_users(config, client):
+        user_description = get_user_description(user_email, user_name)
+        utils.print_bright(
+            f"Scanning recordings from user {user_description} - Starting at {date_to_str(from_date)} "
+            f"and up to {date_to_str(to_date)} (inclusive)."
+        )
+
+        meeting_uuids = get_meeting_uuids(client, user_email, from_date, to_date)
+        meetings = get_meetings(client, meeting_uuids, conn=conn)
+        inventory = build_inventory_from_meetings(
+            config, meetings, host_folder=get_user_host_folder(config, user_email)
+        )
+        all_files.extend(inventory.files)
+        meeting_count += inventory.meeting_count
+        skipped_missing_size_count += inventory.skipped_missing_size_count
+        utils.print_bright(
+            "######################################################################"
+        )
+        print()
+
+    return RecordingInventory(
+        files=all_files,
+        meeting_count=meeting_count,
+        skipped_missing_size_count=skipped_missing_size_count,
+    )
+
+
+def get_meeting_uuids(client, user_email, start_date, end_date):
+    meeting_uuids = []
     local_start_date = start_date
     delta = datetime.timedelta(days=29)
 
     utils.print_bright("Scanning for recorded meetings:")
-    estimated_iterations = math.ceil(
-        (end_date - start_date) / datetime.timedelta(days=30)
+    estimated_iterations = max(
+        1, math.ceil((end_date - start_date) / datetime.timedelta(days=30))
     )
     with utils.percentage_tqdm(total=estimated_iterations) as progress_bar:
         while local_start_date <= end_date:
@@ -203,7 +370,10 @@ def get_meeting_uuids(user_email, start_date, end_date):
 
             local_start_date_str = date_to_str(local_start_date)
             local_end_date_str = date_to_str(local_end_date)
-            url = f"https://api.zoom.us/v2/users/{user_email}/recordings?from={local_start_date_str}&to={local_end_date_str}"
+            url = (
+                f"https://api.zoom.us/v2/users/{user_email}/recordings?"
+                f"from={local_start_date_str}&to={local_end_date_str}"
+            )
 
             ids = []
             for page in client.paginate(url):
@@ -216,145 +386,268 @@ def get_meeting_uuids(user_email, start_date, end_date):
     return meeting_uuids
 
 
-def get_meetings(meeting_uuids):
+def get_meetings(client, meeting_uuids, conn=None, log_failures=True, clear_success=True):
     meetings = []
-    conn = sqlite3.connect("meetings.db")
 
     if meeting_uuids:
         utils.print_bright("Scanning for recordings:")
 
-        # Create a cursor object to execute SQL queries
-        cursor = conn.cursor()
         for meeting_uuid in utils.percentage_tqdm(meeting_uuids):
-            url = f"https://api.zoom.us/v2/meetings/{utils.double_encode(meeting_uuid)}/recordings"
+            url = (
+                "https://api.zoom.us/v2/meetings/"
+                f"{utils.double_encode(meeting_uuid)}/recordings"
+            )
             try:
-                meetings.append(client.get(url))
-                cursor.execute("DELETE FROM meetings WHERE uuid = ?", (meeting_uuid,))
-            except Exception as e:
-                cursor.execute(
-                    "INSERT OR IGNORE INTO meetings (uuid) VALUES (?)", (meeting_uuid,)
-                )
+                meeting = client.get(url)
+                meeting["_requested_uuid"] = meeting_uuid
+                meetings.append(meeting)
+                if conn is not None and clear_success:
+                    clear_meeting_uuid(conn, meeting_uuid)
+            except Exception as error:
+                if conn is not None and log_failures:
+                    log_meeting_uuid(conn, meeting_uuid)
                 utils.print_bright(
-                    f"Logging error occurred while retrieving recordings for meeting {meeting_uuid}: {e}"
+                    "Logging error occurred while retrieving recordings for "
+                    f"meeting {meeting_uuid}: {utils.redact_sensitive_text(error)}"
                 )
-
-    conn.commit()
 
     return meetings
 
 
-def download_recordings_from_meetings(meetings, host_folder):
-    file_count, total_size, skipped_count = 0, 0, 0
+def build_inventory_from_meetings(config, meetings, host_folder=None):
+    files = []
+    skipped_missing_size_count = 0
 
     for meeting in meetings:
-        if (
-            CONFIG.TOPICS
-            and meeting["topic"] not in CONFIG.TOPICS
-            and utils.slugify(meeting["topic"]) not in CONFIG.TOPICS
-        ):
+        if not meeting_matches_topic_filter(config, meeting):
             continue
 
+        folder = host_folder or get_meeting_host_folder(config, meeting)
         recording_files = meeting.get("recording_files") or []
         participant_audio_files = (
             (meeting.get("participant_audio_files") or [])
-            if CONFIG.INCLUDE_PARTICIPANT_AUDIO
+            if config.INCLUDE_PARTICIPANT_AUDIO
             else []
         )
 
         for recording_file in recording_files + participant_audio_files:
-            if "file_size" not in recording_file:
+            if "file_size" not in recording_file or "id" not in recording_file:
+                skipped_missing_size_count += 1
                 continue
 
-            if (
-                CONFIG.RECORDING_FILE_TYPES
-                and recording_file["file_type"] not in CONFIG.RECORDING_FILE_TYPES
-            ):
+            if not recording_file_matches_type_filter(config, recording_file):
                 continue
 
-            url = recording_file["download_url"]
-            topic = utils.slugify(meeting["topic"])
-            ext = (
-                recording_file.get("file_extension")
-                or os.path.splitext(recording_file["file_name"])[1]
-            )
-            recording_name = utils.slugify(
-                f'{topic}__{recording_file["recording_start"]}'
-            )
-            file_id = recording_file["id"]
-            file_name_suffix = (
-                os.path.splitext(recording_file["file_name"])[0] + "__"
-                if "file_name" in recording_file
-                else ""
-            )
-            recording_type_suffix = (
-                recording_file["recording_type"] + "__"
-                if "recording_type" in recording_file
-                else ""
-            )
-            file_name = (
-                utils.slugify(
-                    f"{recording_name}__{recording_type_suffix}{file_name_suffix}{file_id[-8:]}"
-                )
-                + "."
-                + ext
-            )
-            file_size = int(recording_file["file_size"])
+            files.append(make_inventory_item(config, meeting, recording_file, folder))
 
-            if download_recording_file(
-                url, host_folder, file_name, file_size, topic, recording_name
-            ):
-                total_size += file_size
-                file_count += 1
-            else:
-                skipped_count += 1
-
-    return file_count, total_size, skipped_count
-
-
-def download_recording_file(
-    download_url, host_folder, file_name, file_size, topic, recording_name
-):
-    if CONFIG.VERBOSE_OUTPUT:
-        print()
-        utils.print_dim(f"URL: {download_url}")
-
-    file_path = create_path(host_folder, file_name, topic, recording_name)
-
-    if (
-        os.path.exists(file_path)
-        and abs(os.path.getsize(file_path) - file_size)
-        <= CONFIG.FILE_SIZE_MISMATCH_TOLERANCE
-    ):
-        utils.print_dim(f"Skipping existing file: {file_name}")
-        return False
-    elif os.path.exists(file_path):
-        utils.print_dim_red(f"Deleting corrupt file: {file_name}")
-        os.remove(file_path)
-
-    utils.print_bright(f"Downloading: {file_name}")
-    utils.wait_for_disk_space(
-        file_size, CONFIG.OUTPUT_PATH, CONFIG.MINIMUM_FREE_DISK, interval=5
+    matched_meetings = {item.meeting_uuid for item in files}
+    return RecordingInventory(
+        files=files,
+        meeting_count=len(matched_meetings),
+        skipped_missing_size_count=skipped_missing_size_count,
     )
-    tmp_file_path = file_path + ".tmp"
+
+
+def meeting_matches_topic_filter(config, meeting):
+    topic = meeting.get("topic", "")
+    return not (
+        config.TOPICS
+        and topic not in config.TOPICS
+        and utils.slugify(topic) not in config.TOPICS
+    )
+
+
+def recording_file_matches_type_filter(config, recording_file):
+    return not (
+        config.RECORDING_FILE_TYPES
+        and recording_file.get("file_type") not in config.RECORDING_FILE_TYPES
+    )
+
+
+def make_inventory_item(config, meeting, recording_file, host_folder):
+    topic = utils.slugify(meeting.get("topic", "untitled"))
+    recording_name = utils.slugify(
+        f'{topic}__{recording_file.get("recording_start", "unknown-start")}'
+    )
+    file_name = build_file_name(recording_file, recording_name)
+    destination_path = create_path(
+        config, host_folder, file_name, topic, recording_name, create_dirs=False
+    )
+    file_size = int(recording_file["file_size"])
+    local_exists = os.path.exists(destination_path)
+    local_size_matches = (
+        local_exists
+        and abs(os.path.getsize(destination_path) - file_size)
+        <= config.FILE_SIZE_MISMATCH_TOLERANCE
+    )
+
+    return RecordingItem(
+        meeting_uuid=meeting.get("_requested_uuid") or meeting.get("uuid") or str(meeting.get("id")),
+        topic=topic,
+        recording_id=recording_file["id"],
+        file_type=recording_file.get("file_type", ""),
+        file_size=file_size,
+        download_url=recording_file.get("download_url", ""),
+        destination_path=destination_path,
+        file_name=file_name,
+        recording_name=recording_name,
+        recording_type=recording_file.get("recording_type", ""),
+        local_exists=local_exists,
+        local_size_matches=local_size_matches,
+        source_kind="participant_audio"
+        if recording_file.get("participant_email")
+        else "recording_file",
+    )
+
+
+def build_file_name(recording_file, recording_name):
+    raw_file_name = recording_file.get("file_name", "")
+    extension = recording_file.get("file_extension") or os.path.splitext(raw_file_name)[1]
+    extension = str(extension).lstrip(".") or "download"
+    file_id = recording_file["id"]
+    file_name_suffix = (
+        os.path.splitext(raw_file_name)[0] + "__" if raw_file_name else ""
+    )
+    recording_type_suffix = (
+        recording_file["recording_type"] + "__" if "recording_type" in recording_file else ""
+    )
+    return (
+        utils.slugify(
+            f"{recording_name}__{recording_type_suffix}{file_name_suffix}{file_id[-8:]}"
+        )
+        + "."
+        + extension
+    )
+
+
+def create_path(config, host_folder, file_name, topic, recording_name, create_dirs=True):
+    folder_path = host_folder
+
+    if config.GROUP_BY_TOPIC:
+        folder_path = os.path.join(folder_path, topic)
+    if config.GROUP_BY_RECORDING:
+        folder_path = os.path.join(folder_path, recording_name)
+
+    if create_dirs:
+        os.makedirs(folder_path, exist_ok=True)
+
+    return os.path.join(folder_path, file_name)
+
+
+def print_inventory_summary(inventory):
+    utils.print_bright("Recording inventory:")
+    print(f"Matched meetings: {inventory.meeting_count}")
+    print(f"Matched files: {len(inventory.files)}")
+    print(f"Matched remote size: {utils.size_to_string(inventory.total_size)}")
+    print(
+        f"Already present locally: {utils.size_to_string(inventory.already_present_size)}"
+    )
+    print(f"Additional download size: {utils.size_to_string(inventory.additional_size)}")
+    if inventory.skipped_missing_size_count:
+        print(f"Skipped files missing size/id: {inventory.skipped_missing_size_count}")
+    print()
+
+
+def check_destination_space(config, inventory, fail_on_shortage):
+    status = get_space_status(config, inventory)
+    print_destination_space_status(status)
+    if fail_on_shortage and not status.has_enough_space:
+        raise RuntimeError(
+            "Not enough free space at destination. "
+            f"Need {utils.size_to_string(status.required_bytes)} including reserve, "
+            f"but only {utils.size_to_string(status.free_bytes)} is available."
+        )
+    return status
+
+
+def get_space_status(config, inventory):
+    usage_path = utils.find_existing_parent(config.OUTPUT_PATH)
+    free_bytes = shutil.disk_usage(usage_path).free
+    reserve_bytes = config.MINIMUM_FREE_DISK
+    additional_bytes = inventory.additional_size
+    required_bytes = additional_bytes + reserve_bytes
+    return SpaceStatus(
+        usage_path=usage_path,
+        free_bytes=free_bytes,
+        required_bytes=required_bytes,
+        additional_bytes=additional_bytes,
+        reserve_bytes=reserve_bytes,
+    )
+
+
+def print_destination_space_status(status):
+    utils.print_bright("Destination drive space:")
+    print(f"Checked path: {status.usage_path}")
+    print(f"Free space: {utils.size_to_string(status.free_bytes)}")
+    print(f"Additional download size: {utils.size_to_string(status.additional_bytes)}")
+    print(f"Configured reserve: {utils.size_to_string(status.reserve_bytes)}")
+    print(f"Required free space: {utils.size_to_string(status.required_bytes)}")
+    if status.has_enough_space:
+        print(f"{Fore.GREEN}Enough free space is available.{Fore.RESET}")
+    else:
+        print(f"{Fore.RED}Not enough free space is available.{Fore.RESET}")
+    print()
+
+
+def download_inventory(config, client, inventory):
+    summary = DownloadSummary()
+
+    for item in inventory.files:
+        try:
+            result = download_recording_item(config, client, item)
+        except Exception as error:
+            summary.failed_count += 1
+            summary.failed_meeting_uuids.add(item.meeting_uuid)
+            utils.print_dim_red(
+                f"Download failed for {item.file_name}: {utils.redact_sensitive_text(error)}"
+            )
+            continue
+
+        if result:
+            summary.downloaded_count += 1
+            summary.downloaded_size += item.file_size
+        else:
+            summary.skipped_count += 1
+
+    return summary
+
+
+def download_recording_item(config, client, item):
+    if config.VERBOSE_OUTPUT:
+        print()
+        utils.print_dim(f"URL: {utils.redact_url(item.download_url)}")
+
+    if item.local_size_matches:
+        utils.print_dim(f"Skipping existing file: {item.file_name}")
+        return False
+
+    if item.local_exists:
+        utils.print_dim_red(f"Deleting corrupt file: {item.file_name}")
+        os.remove(item.destination_path)
+
+    utils.print_bright(f"Downloading: {item.file_name}")
+    os.makedirs(os.path.dirname(item.destination_path), exist_ok=True)
+    utils.wait_for_disk_space(
+        item.file_size, config.OUTPUT_PATH, config.MINIMUM_FREE_DISK, interval=5
+    )
+    tmp_file_path = item.destination_path + ".tmp"
 
     if download_with_retry(
-        download_url,
+        client,
+        item.download_url,
         tmp_file_path,
-        file_size,
-        CONFIG.VERBOSE_OUTPUT,
-        CONFIG.FILE_SIZE_MISMATCH_TOLERANCE,
+        item.file_size,
+        config.VERBOSE_OUTPUT,
+        config.FILE_SIZE_MISMATCH_TOLERANCE,
     ):
-        os.rename(tmp_file_path, file_path)
+        os.rename(tmp_file_path, item.destination_path)
         return True
-    else:
-        return False
 
-    os.rename(tmp_file_path, file_path)
-
-    return True
+    raise RuntimeError("Max retries reached, download failed.")
 
 
 def download_with_retry(
+    client,
     download_url,
     tmp_file_path,
     file_size,
@@ -365,62 +658,189 @@ def download_with_retry(
     retries = 0
     while retries < max_retries:
         try:
-            client.do_with_token(
-                lambda t: utils.download_with_progress(
-                    f"{download_url}?access_token={t}",
-                    tmp_file_path,
-                    file_size,
-                    verbose_output,
-                    file_size_mismatch_tolerance,
-                )
+            response = client.request("GET", download_url, stream=True)
+            utils.download_response_with_progress(
+                response,
+                tmp_file_path,
+                file_size,
+                verbose_output,
+                file_size_mismatch_tolerance,
             )
-            return True  # Download succeeded, no need to retry
-        except Exception as e:
-            print(f"Download failed: {e}")
+            return True
+        except Exception as error:
             retries += 1
+            print(f"Download failed: {utils.redact_sensitive_text(error)}")
             if retries < max_retries:
                 print(f"Retrying ({retries}/{max_retries}) in 5 seconds...")
                 time.sleep(5)
-    print("Max retries reached, download failed.")
     return False
 
 
-def create_path(host_folder, file_name, topic, recording_name):
-    folder_path = host_folder
+def print_download_summary(summary):
+    total_size_str = utils.size_to_string(summary.downloaded_size)
+    print(
+        f"{Style.BRIGHT}Downloaded {Fore.GREEN}{summary.downloaded_count}{Fore.RESET} files.",
+        f"Total size: {Fore.GREEN}{total_size_str}{Fore.RESET}.{Style.RESET_ALL}",
+        f"Skipped: {summary.skipped_count} files.",
+        f"Failed: {summary.failed_count} files.",
+    )
 
-    if CONFIG.GROUP_BY_TOPIC:
-        folder_path = os.path.join(folder_path, topic)
-    if CONFIG.GROUP_BY_RECORDING:
-        folder_path = os.path.join(folder_path, recording_name)
 
-    os.makedirs(folder_path, exist_ok=True)
+def validate_delete_config(config):
+    action = config_value(config, "DELETE_ACTION", "trash")
+    scope = config_value(config, "DELETE_SCOPE", "files")
+    dry_run = config_value(config, "DRY_RUN", True)
+    confirm = config_value(config, "CONFIRM_DELETE", "")
+    allow_permanent = config_value(config, "ALLOW_PERMANENT_DELETE", False)
 
-    return os.path.join(folder_path, file_name)
+    if action not in DELETE_ACTIONS:
+        raise ConfigError(f"DELETE_ACTION must be one of {sorted(DELETE_ACTIONS)}.")
+    if scope not in DELETE_SCOPES:
+        raise ConfigError(f"DELETE_SCOPE must be one of {sorted(DELETE_SCOPES)}.")
+    if action == "delete" and (not allow_permanent or confirm != "DELETE PERMANENTLY"):
+        raise ConfigError(
+            "Permanent deletion requires DELETE_ACTION = 'delete', "
+            "ALLOW_PERMANENT_DELETE = True, and CONFIRM_DELETE = 'DELETE PERMANENTLY'."
+        )
+    if not dry_run and action == "trash" and confirm != "DELETE":
+        raise ConfigError("Trash deletion requires CONFIRM_DELETE = 'DELETE'.")
+
+    return action, scope, dry_run
+
+
+def delete_inventory(config, client, inventory):
+    action, scope, dry_run = validate_delete_config(config)
+    summary = DeleteSummary()
+
+    if scope == "meetings":
+        targets = [(meeting_uuid, None) for meeting_uuid in inventory.meeting_uuids]
+    else:
+        targets = [(item.meeting_uuid, item) for item in inventory.files]
+
+    if dry_run:
+        utils.print_bright("Deletion dry run:")
+
+    for meeting_uuid, item in targets:
+        try:
+            if dry_run:
+                print_delete_target(meeting_uuid, item, action, scope)
+                summary.skipped_count += 1
+                continue
+
+            delete_recording_target(client, meeting_uuid, item, action)
+            summary.deleted_count += 1
+        except Exception as error:
+            summary.failed_count += 1
+            utils.print_dim_red(
+                f"Delete failed for meeting {meeting_uuid}: {utils.redact_sensitive_text(error)}"
+            )
+
+    return summary
+
+
+def delete_one(config, client):
+    action, _, dry_run = validate_delete_config(config)
+    meeting_uuid = config_value(config, "DELETE_MEETING_UUID", None)
+    recording_id = config_value(config, "DELETE_RECORDING_ID", None)
+
+    if not meeting_uuid:
+        raise ConfigError("MODE = 'delete_one' requires DELETE_MEETING_UUID.")
+
+    item = None
+    if recording_id:
+        item = RecordingItem(
+            meeting_uuid=meeting_uuid,
+            topic="",
+            recording_id=recording_id,
+            file_type="",
+            file_size=0,
+            download_url="",
+            destination_path="",
+            file_name=recording_id,
+            recording_name="",
+            recording_type="",
+            local_exists=False,
+            local_size_matches=False,
+            source_kind="recording_file",
+        )
+
+    if dry_run:
+        utils.print_bright("Deletion dry run:")
+        print_delete_target(meeting_uuid, item, action, "files" if item else "meetings")
+        print_delete_summary(DeleteSummary(skipped_count=1))
+        return
+
+    delete_recording_target(client, meeting_uuid, item, action)
+    print_delete_summary(DeleteSummary(deleted_count=1))
+
+
+def print_delete_target(meeting_uuid, item, action, scope):
+    encoded_uuid = utils.double_encode(meeting_uuid)
+    if item is None:
+        print(
+            "Would delete meeting recording set: "
+            f"meeting={meeting_uuid}, action={action}, "
+            f"endpoint=/meetings/{encoded_uuid}/recordings"
+        )
+        return
+
+    print(
+        "Would delete recording file: "
+        f"meeting={meeting_uuid}, recording_id={item.recording_id}, "
+        f"file={item.file_name}, size={utils.size_to_string(item.file_size)}, "
+        f"scope={scope}, action={action}, "
+        f"endpoint=/meetings/{encoded_uuid}/recordings/{item.recording_id}"
+    )
+
+
+def delete_recording_target(client, meeting_uuid, item, action):
+    encoded_uuid = utils.double_encode(meeting_uuid)
+    if item is None:
+        url = f"https://api.zoom.us/v2/meetings/{encoded_uuid}/recordings"
+    else:
+        url = (
+            f"https://api.zoom.us/v2/meetings/{encoded_uuid}/recordings/"
+            f"{item.recording_id}"
+        )
+    client.delete(url, params={"action": action})
+
+
+def print_delete_summary(summary):
+    print(
+        f"{Style.BRIGHT}Deleted {Fore.GREEN}{summary.deleted_count}{Fore.RESET} targets.",
+        f"Dry-run/skipped: {summary.skipped_count}.",
+        f"Failed: {summary.failed_count}.{Style.RESET_ALL}",
+    )
 
 
 if __name__ == "__main__":
     try:
         main()
-    except AttributeError as error:
-        if isinstance(error.obj, ModuleType) and error.obj.__name__ == "config":
-            print()
-            utils.print_bright_red(
-                f"Variable {error.name} is not defined in config.py. "
-                f"See config_template.py for the complete list of variables."
-            )
-        else:
-            raise
-
-    except Exception as error:
+    except ConfigError as error:
         print()
-        if not getattr(CONFIG, "VERBOSE_OUTPUT"):
-            utils.print_bright_red(f"Error: {error}")
-        elif utils.is_debug():
-            raise
-        else:
-            utils.print_dim_red(traceback.format_exc())
-
+        utils.print_bright_red(error)
+        sys.exit(1)
+    except AttributeError as error:
+        print()
+        utils.print_bright_red(
+            f"Missing config value: {error}. See config_template.py for the complete list."
+        )
+        sys.exit(1)
     except KeyboardInterrupt:
         print()
         utils.print_bright_red("Interrupted by the user")
-        exit(1)
+        sys.exit(1)
+    except Exception as error:
+        print()
+        verbose = False
+        try:
+            verbose = bool(getattr(importlib.import_module("config"), "VERBOSE_OUTPUT", False))
+        except Exception:
+            pass
+        if verbose and utils.is_debug():
+            raise
+        if verbose:
+            utils.print_dim_red(traceback.format_exc())
+        else:
+            utils.print_bright_red(f"Error: {utils.redact_sensitive_text(error)}")
+        sys.exit(1)

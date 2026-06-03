@@ -8,7 +8,6 @@ import urllib
 from functools import reduce
 from json import dumps
 from time import sleep
-import socket
 from colorama import Fore, Style
 from tqdm import tqdm
 
@@ -111,6 +110,15 @@ def wait_for_disk_space(file_size, path, minimum_free_disk, interval):
 		free_disk = shutil.disk_usage(path)[2]
 		i += 1
 
+def find_existing_parent(path):
+	path = os.path.abspath(path)
+	while not os.path.exists(path):
+		parent = os.path.dirname(path)
+		if parent == path:
+			return path
+		path = parent
+	return path
+
 def size_to_string(size_bytes, separator = ''):
 	if size_bytes == 0:
 		return '0' + str(separator) + 'B'
@@ -130,9 +138,37 @@ def print_dim_red(msg):
 	print_dim(Fore.RED + str(msg) + Fore.RESET)	
 
 def print_dim(msg):
-	print(Style.DIM + str(msg) + Style.RESET_ALL)
+    print(Style.DIM + str(msg) + Style.RESET_ALL)
 
-def download_with_progress(url, output_path, expected_size, verbose_output, size_tolerance):
+def redact_url(url):
+	parsed_url = urllib.parse.urlparse(str(url))
+	if not parsed_url.query:
+		return str(url)
+
+	query = urllib.parse.parse_qsl(parsed_url.query, keep_blank_values=True)
+	redacted_query = []
+	for key, value in query:
+		if key.lower() in {"access_token", "token", "signature", "sig"}:
+			value = "[REDACTED]"
+		redacted_query.append((key, value))
+
+	return urllib.parse.ParseResult(
+		parsed_url.scheme,
+		parsed_url.netloc,
+		parsed_url.path,
+		parsed_url.params,
+		urllib.parse.urlencode(redacted_query),
+		parsed_url.fragment,
+	).geturl()
+
+def redact_sensitive_text(text):
+	text = str(text)
+	text = re.sub(r"access_token=([^&\s]+)", "access_token=[REDACTED]", text)
+	text = re.sub(r"token=([^&\s]+)", "token=[REDACTED]", text)
+	text = re.sub(r"(Bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", text)
+	return text
+
+def download_response_with_progress(response, output_path, expected_size, verbose_output, size_tolerance):
 	class download_progress_bar(tqdm):
 		def __init__(self, expected_size=None, dynamic_ncols=True):
 			r_bar = '| {n_fmt}{unit}/{total_fmt}{unit} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
@@ -147,14 +183,17 @@ def download_with_progress(url, output_path, expected_size, verbose_output, size
 			if tsize is not None:
 				self.total = tsize
 			self.update(b * bsize - self.n)
-			
+
 
 	with download_progress_bar(expected_size=expected_size) as t:
 		try:
-			download_speed = 1.1  # simulate slow download speed
-			time_out = expected_size / download_speed 		
-			# socket.setdefaulttimeout(time_out)
-			urllib.request.urlretrieve(url, filename=output_path, reporthook=t.update_to)
+			with open(output_path, "wb") as output_file:
+				for chunk in response.iter_content(chunk_size=1024 * 1024):
+					if not chunk:
+						continue
+					output_file.write(chunk)
+					t.update(len(chunk))
+
 			file_size = os.path.getsize(output_path)
 			if abs(file_size - expected_size) > size_tolerance:
 				t.update_to(bsize=0, tsize=expected_size)
@@ -164,7 +203,10 @@ def download_with_progress(url, output_path, expected_size, verbose_output, size
 			   			f'Size difference: {size_to_string(abs(file_size - expected_size))}.\n'
 						f'You might want to increase FILE_SIZE_MISMATCH_TOLERANCE in config.py'
 					)
-				raise Exception(f'Failed to download file at {url}.{"" if verbose_output else " Enable verbose output for more details."}')
+				raise Exception(
+					"Failed to download file."
+					f'{"" if verbose_output else " Enable verbose output for more details."}'
+				)
 			
 			t.update_to(bsize=file_size, tsize=file_size)
 			t.close()

@@ -4,8 +4,13 @@ CLIENT_ID = R"##########"
 CLIENT_SECRET = R"##########"
 
 
-# Insert non ready files flag here, if it's true only files that were not ready during last runtime will be downloaded.
-NOT_READY_FILES_ONLY = False
+# Tool mode.
+# - "download": scan, check destination free space, and download matched recordings.
+# - "estimate": scan and report size/free-space requirements without downloading.
+# - "retry_not_ready": retry meeting UUIDs logged in meetings.db and download them.
+# - "delete_bulk": delete matched Zoom cloud recordings using the filters below.
+# - "delete_one": delete one meeting recording set or one recording file by ID.
+MODE = "download"
 
 
 # Put your own download path here, no need to escape backslashes but avoid ending with one.
@@ -56,6 +61,36 @@ INCLUDE_PARTICIPANT_AUDIO = True
 
 # Set to True for more verbose output.
 VERBOSE_OUTPUT = False
+
+
+# If True, downloads fail before the first file when the destination drive does not have enough free space
+# for all missing matched files plus MINIMUM_FREE_DISK. If False, the script prints a warning and falls back
+# to waiting before each individual file.
+FAIL_IF_NOT_ENOUGH_SPACE = True
+
+
+# Deletion safety settings. Deletion is dry-run by default.
+DRY_RUN = True
+
+# Required for real trash deletion: CONFIRM_DELETE = "DELETE"
+# Required for permanent deletion: CONFIRM_DELETE = "DELETE PERMANENTLY"
+CONFIRM_DELETE = ""
+
+# Use "trash" to move recordings to Zoom trash, or "delete" for permanent deletion.
+DELETE_ACTION = "trash"
+
+# Permanent deletion requires DELETE_ACTION = "delete", ALLOW_PERMANENT_DELETE = True,
+# and CONFIRM_DELETE = "DELETE PERMANENTLY".
+ALLOW_PERMANENT_DELETE = False
+
+# In delete_bulk mode, use "files" to delete matched recording files individually or "meetings"
+# to delete each matched meeting's full recording set.
+DELETE_SCOPE = "files"
+
+# Used only when MODE = "delete_one". If DELETE_RECORDING_ID is empty, the meeting's full
+# recording set is deleted. If DELETE_RECORDING_ID is set, only that recording file is deleted.
+DELETE_MEETING_UUID = None
+DELETE_RECORDING_ID = None
 
 # Constants used for indicating size in bytes.
 B = 1
