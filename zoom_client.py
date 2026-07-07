@@ -1,8 +1,10 @@
 import email.utils
+import threading
 import time
 from urllib.parse import urljoin
 
 import requests
+from requests.adapters import HTTPAdapter
 
 import utils
 
@@ -25,7 +27,8 @@ class zoom_client:
         client_secret: str,
         PAGE_SIZE: int = 300,
         timeout=(10, 120),
-        max_rate_limit_retries: int = 3,
+        max_rate_limit_retries: int = 8,
+        concurrency: int = 8,
         sleep=time.sleep,
     ):
         self.account_id = account_id
@@ -36,6 +39,14 @@ class zoom_client:
         self.max_rate_limit_retries = max_rate_limit_retries
         self.sleep = sleep
         self.cached_token = None
+        self.token_lock = threading.Lock()
+
+        self.session = requests.Session()
+        adapter = HTTPAdapter(
+            pool_connections=concurrency, pool_maxsize=concurrency, max_retries=0
+        )
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     def get(self, url, params=None):
         return self.request("GET", url, params=params).json()
@@ -64,21 +75,30 @@ class zoom_client:
 
         return response
 
+    def _get_token(self):
+        with self.token_lock:
+            if self.cached_token is None:
+                self.cached_token = self.fetch_token()
+            return self.cached_token
+
+    def _refresh_token(self, stale_token):
+        with self.token_lock:
+            if self.cached_token == stale_token:
+                self.cached_token = self.fetch_token()
+            return self.cached_token
+
     def _request_with_token(self, method, url, params=None, json=None, stream=False):
-        token = self.cached_token or self.fetch_token()
-        self.cached_token = token
+        token = self._get_token()
         response = self._send(method, url, token, params=params, json=json, stream=stream)
 
         if response.status_code == 401:
-            self.cached_token = self.fetch_token()
-            response = self._send(
-                method, url, self.cached_token, params=params, json=json, stream=stream
-            )
+            token = self._refresh_token(token)
+            response = self._send(method, url, token, params=params, json=json, stream=stream)
 
         return response
 
     def _send(self, method, url, token, params=None, json=None, stream=False):
-        return requests.request(
+        return self.session.request(
             method,
             url,
             headers=self.get_headers(token),
@@ -93,7 +113,7 @@ class zoom_client:
             "grant_type": "account_credentials",
             "account_id": self.account_id,
         }
-        response = requests.post(
+        response = self.session.post(
             self.TOKEN_URL,
             auth=(self.client_id, self.client_secret),
             data=data,

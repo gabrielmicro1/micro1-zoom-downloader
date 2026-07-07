@@ -3,6 +3,12 @@ import responses
 from zoom_client import zoom_client
 
 
+def test_client_uses_a_single_pooled_session():
+    client = zoom_client("acct", "client", "secret", concurrency=5)
+    adapter = client.session.get_adapter("https://api.zoom.us/")
+    assert adapter._pool_maxsize == 5
+
+
 @responses.activate
 def test_request_refreshes_token_once_after_401():
     responses.add(
