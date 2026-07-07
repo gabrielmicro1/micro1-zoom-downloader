@@ -1,4 +1,5 @@
 import email.utils
+import random
 import threading
 import time
 from urllib.parse import urljoin
@@ -16,6 +17,27 @@ class ZoomClientError(Exception):
         self.response_text = response_text
 
 
+class RateLimiter:
+    def __init__(self, rate_per_second, sleep=time.sleep, monotonic=time.monotonic):
+        self.min_interval = 1.0 / rate_per_second if rate_per_second else 0.0
+        self.sleep = sleep
+        self.monotonic = monotonic
+        self.lock = threading.Lock()
+        self.next_time = None
+
+    def acquire(self):
+        if not self.min_interval:
+            return
+        with self.lock:
+            now = self.monotonic()
+            if self.next_time is None or now >= self.next_time:
+                self.next_time = now + self.min_interval
+                return
+            wait = self.next_time - now
+            self.next_time += self.min_interval
+        self.sleep(wait)
+
+
 class zoom_client:
     BASE_URL = "https://api.zoom.us/v2/"
     TOKEN_URL = "https://api.zoom.us/oauth/token"
@@ -29,7 +51,11 @@ class zoom_client:
         timeout=(10, 120),
         max_rate_limit_retries: int = 8,
         concurrency: int = 8,
+        requests_per_second=8,
+        backoff_base: float = 1.0,
+        backoff_jitter=None,
         sleep=time.sleep,
+        monotonic=time.monotonic,
     ):
         self.account_id = account_id
         self.client_id = client_id
@@ -38,6 +64,9 @@ class zoom_client:
         self.timeout = timeout
         self.max_rate_limit_retries = max_rate_limit_retries
         self.sleep = sleep
+        self.backoff_base = backoff_base
+        self.backoff_jitter = backoff_jitter or (lambda: random.uniform(0, backoff_base))
+        self.rate_limiter = RateLimiter(requests_per_second, sleep=sleep, monotonic=monotonic)
         self.cached_token = None
         self.token_lock = threading.Lock()
 
@@ -60,12 +89,14 @@ class zoom_client:
             method, request_url, params=params, json=json, stream=stream
         )
 
-        rate_limit_retries = 0
-        while response.status_code == 429 and rate_limit_retries < self.max_rate_limit_retries:
+        attempt = 0
+        while response.status_code == 429 and attempt < self.max_rate_limit_retries:
             retry_after = self._retry_after_seconds(response.headers.get("Retry-After"))
-            if retry_after > 0:
-                self.sleep(retry_after)
-            rate_limit_retries += 1
+            backoff = self.backoff_base * (2 ** attempt)
+            wait = max(retry_after, backoff) + self.backoff_jitter()
+            if wait > 0:
+                self.sleep(wait)
+            attempt += 1
             response = self._request_with_token(
                 method, request_url, params=params, json=json, stream=stream
             )
@@ -98,6 +129,7 @@ class zoom_client:
         return response
 
     def _send(self, method, url, token, params=None, json=None, stream=False):
+        self.rate_limiter.acquire()
         return self.session.request(
             method,
             url,
@@ -109,6 +141,7 @@ class zoom_client:
         )
 
     def fetch_token(self):
+        self.rate_limiter.acquire()
         data = {
             "grant_type": "account_credentials",
             "account_id": self.account_id,

@@ -122,6 +122,9 @@ def create_client(config):
         account_id=config.ACCOUNT_ID,
         client_id=config.CLIENT_ID,
         client_secret=config.CLIENT_SECRET,
+        concurrency=config_value(config, "CONCURRENCY", 8),
+        requests_per_second=config_value(config, "REQUESTS_PER_SECOND", 8),
+        max_rate_limit_retries=config_value(config, "MAX_RATE_LIMIT_RETRIES", 8),
     )
 
 

@@ -1,6 +1,6 @@
 import responses
 
-from zoom_client import zoom_client
+from zoom_client import RateLimiter, zoom_client
 
 
 def test_client_uses_a_single_pooled_session():
@@ -70,7 +70,40 @@ def test_request_honors_retry_after_for_rate_limit():
         json={"id": "me"},
     )
 
-    client = zoom_client("acct", "client", "secret", sleep=sleeps.append)
+    client = zoom_client("acct", "client", "secret", sleep=sleeps.append,
+                         requests_per_second=None, backoff_base=1.0,
+                         backoff_jitter=lambda: 0)
 
     assert client.get("/users/me") == {"id": "me"}
     assert sleeps == [2]
+
+
+def test_rate_limiter_spaces_calls():
+    now = [0.0]
+    sleeps = []
+    limiter = RateLimiter(2, sleep=sleeps.append, monotonic=lambda: now[0])
+
+    limiter.acquire()   # first call: no wait
+    limiter.acquire()   # second call at same time: must wait 0.5s
+
+    assert sleeps == [0.5]
+
+
+@responses.activate
+def test_backoff_uses_exponential_when_no_retry_after():
+    sleeps = []
+    responses.add(responses.POST, "https://api.zoom.us/oauth/token",
+                  json={"access_token": "t"}, status=200)
+    responses.add(responses.GET, "https://api.zoom.us/v2/users/me", status=429,
+                  json={"message": "slow down"})
+    responses.add(responses.GET, "https://api.zoom.us/v2/users/me", status=429,
+                  json={"message": "slow down"})
+    responses.add(responses.GET, "https://api.zoom.us/v2/users/me", status=200,
+                  json={"id": "me"})
+
+    client = zoom_client("acct", "client", "secret", sleep=sleeps.append,
+                         requests_per_second=None, backoff_base=1.0,
+                         backoff_jitter=lambda: 0)
+
+    assert client.get("/users/me") == {"id": "me"}
+    assert sleeps == [1.0, 2.0]  # 2**0, 2**1
