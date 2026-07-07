@@ -1,3 +1,4 @@
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -301,3 +302,74 @@ def test_redacts_access_tokens_from_text_and_urls():
     assert "secret-token" not in utils.redact_sensitive_text(text)
     assert "abc.def" not in utils.redact_sensitive_text(text)
     assert "secret-token" not in utils.redact_url(text.split()[0])
+
+
+class RecordingDownloadClient:
+    """Records concurrent download calls and serves fixed content."""
+
+    def __init__(self):
+        self.threads = set()
+        self._lock = threading.Lock()
+
+    def request(self, method, url, stream=False):
+        with self._lock:
+            self.threads.add(threading.current_thread().name)
+        return FakeDownloadResponse()
+
+
+def make_item(tmp_path, index, size=6, fail=False):
+    url = "https://download.example.com/fail" if fail else "https://download.example.com/ok"
+    return zbd.RecordingItem(
+        meeting_uuid=f"m{index}",
+        topic="topic",
+        recording_id=f"r{index}",
+        file_type="MP4",
+        file_size=size,
+        download_url=url,
+        destination_path=str(tmp_path / f"file{index}.mp4"),
+        file_name=f"file{index}.mp4",
+        recording_name="topic",
+        recording_type="",
+        local_exists=False,
+        local_size_matches=False,
+        source_kind="recording_file",
+    )
+
+
+def test_download_inventory_runs_concurrently_and_aggregates(tmp_path):
+    config = make_config(tmp_path, CONCURRENCY=4)
+    inventory = zbd.RecordingInventory(
+        files=[make_item(tmp_path, i) for i in range(6)], meeting_count=6
+    )
+    client = RecordingDownloadClient()
+
+    summary = zbd.download_inventory(config, client, inventory, LocalStorage())
+
+    assert summary.downloaded_count == 6
+    assert summary.downloaded_size == 36
+    assert summary.failed_count == 0
+    assert len(list(tmp_path.glob("file*.mp4"))) == 6
+    assert len(client.threads) > 1  # actually used multiple workers
+
+
+def test_download_inventory_counts_failures_without_aborting(tmp_path, monkeypatch):
+    config = make_config(tmp_path, CONCURRENCY=2)
+    inventory = zbd.RecordingInventory(
+        files=[make_item(tmp_path, 0), make_item(tmp_path, 1)], meeting_count=2
+    )
+    client = RecordingDownloadClient()
+
+    original = zbd.download_recording_item
+
+    def flaky(config, client, item, storage, show_progress=True):
+        if item.recording_id == "r0":
+            raise RuntimeError("boom")
+        return original(config, client, item, storage, show_progress=show_progress)
+
+    monkeypatch.setattr(zbd, "download_recording_item", flaky)
+
+    summary = zbd.download_inventory(config, client, inventory, LocalStorage())
+
+    assert summary.failed_count == 1
+    assert summary.downloaded_count == 1
+    assert "m0" in summary.failed_meeting_uuids

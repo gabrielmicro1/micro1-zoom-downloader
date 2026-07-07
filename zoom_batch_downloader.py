@@ -7,9 +7,11 @@ import os
 import shutil
 import sqlite3
 import sys
+import threading
 import time
 import traceback
 from calendar import monthrange
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 import colorama
@@ -597,23 +599,31 @@ def print_destination_space_status(status):
 
 def download_inventory(config, client, inventory, storage):
     summary = DownloadSummary()
+    workers = max(1, int(config_value(config, "CONCURRENCY", 8)))
+    show_progress = workers == 1
 
-    for item in inventory.files:
+    def worker(item):
         try:
-            result = download_recording_item(config, client, item, storage)
+            result = download_recording_item(config, client, item, storage, show_progress)
         except Exception as error:
-            summary.failed_count += 1
-            summary.failed_meeting_uuids.add(item.meeting_uuid)
-            utils.print_dim_red(
-                f"Download failed for {item.file_name}: {utils.redact_sensitive_text(error)}"
-            )
-            continue
+            return ("failed", item, error)
+        return ("downloaded" if result else "skipped", item, None)
 
-        if result:
-            summary.downloaded_count += 1
-            summary.downloaded_size += item.file_size
-        else:
-            summary.skipped_count += 1
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(worker, item) for item in inventory.files]
+        for future in utils.percentage_tqdm(as_completed(futures), total=len(futures)):
+            status, item, error = future.result()
+            if status == "downloaded":
+                summary.downloaded_count += 1
+                summary.downloaded_size += item.file_size
+            elif status == "skipped":
+                summary.skipped_count += 1
+            else:
+                summary.failed_count += 1
+                summary.failed_meeting_uuids.add(item.meeting_uuid)
+                utils.print_dim_red(
+                    f"Download failed for {item.file_name}: {utils.redact_sensitive_text(error)}"
+                )
 
     return summary
 
