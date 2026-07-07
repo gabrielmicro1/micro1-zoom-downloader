@@ -4,6 +4,15 @@ import pytest
 
 import utils
 import zoom_batch_downloader as zbd
+from storage import LocalStorage
+
+
+class FakeSpaceStorage:
+    def __init__(self, free):
+        self._free = free
+
+    def free_space(self, path):
+        return self._free
 
 
 def make_config(tmp_path, **overrides):
@@ -131,11 +140,9 @@ def test_estimate_space_check_reports_without_failing(tmp_path, monkeypatch):
         ],
         meeting_count=1,
     )
-    monkeypatch.setattr(
-        zbd.shutil, "disk_usage", lambda path: SimpleNamespace(free=25)
+    status = zbd.check_destination_space(
+        config, FakeSpaceStorage(25), inventory, fail_on_shortage=False
     )
-
-    status = zbd.check_destination_space(config, inventory, fail_on_shortage=False)
 
     assert status.required_bytes == 150
     assert status.free_bytes == 25
@@ -164,12 +171,10 @@ def test_download_space_check_fails_before_download_when_short(tmp_path, monkeyp
         ],
         meeting_count=1,
     )
-    monkeypatch.setattr(
-        zbd.shutil, "disk_usage", lambda path: SimpleNamespace(free=25)
-    )
-
     with pytest.raises(RuntimeError, match="Not enough free space"):
-        zbd.check_destination_space(config, inventory, fail_on_shortage=True)
+        zbd.check_destination_space(
+            config, FakeSpaceStorage(25), inventory, fail_on_shortage=True
+        )
 
 
 class FakeDeleteClient:
@@ -284,7 +289,7 @@ def test_retry_not_ready_downloads_and_clears_successful_uuid(tmp_path):
     conn = zbd.ensure_meetings_db(str(tmp_path / "meetings.db"))
     zbd.log_meeting_uuid(conn, "meeting/uuid==")
 
-    zbd.run_retry_not_ready(config, FakeDownloadClient(meeting), conn)
+    zbd.run_retry_not_ready(config, FakeDownloadClient(meeting), conn, LocalStorage())
 
     assert zbd.read_logged_meeting_uuids(conn) == []
     assert len(list(tmp_path.rglob("*.MP4"))) == 1

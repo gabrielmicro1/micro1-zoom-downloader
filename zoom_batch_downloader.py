@@ -16,6 +16,7 @@ import colorama
 from colorama import Fore, Style
 
 import utils
+from storage import create_storage, LocalStorage
 from zoom_client import zoom_client
 
 
@@ -151,10 +152,11 @@ def main():
     run(config)
 
 
-def run(config, client=None, db_path="meetings.db"):
+def run(config, client=None, db_path="meetings.db", storage=None):
     mode = resolve_mode(config)
     config.OUTPUT_PATH = utils.prepend_path_on_windows(config.OUTPUT_PATH)
     client = client or create_client(config)
+    storage = storage or create_storage(config)
 
     if mode == "delete_one":
         delete_one(config, client)
@@ -163,25 +165,24 @@ def run(config, client=None, db_path="meetings.db"):
     conn = ensure_meetings_db(db_path)
     try:
         if mode == "retry_not_ready":
-            run_retry_not_ready(config, client, conn)
+            run_retry_not_ready(config, client, conn, storage)
             return
 
         print_filter_warnings(config)
         from_date, to_date = get_date_range(config)
-        inventory = build_inventory(config, client, conn, from_date, to_date)
+        inventory = build_inventory(config, client, conn, from_date, to_date, storage)
         print_inventory_summary(inventory)
 
         if mode == "estimate":
-            check_destination_space(config, inventory, fail_on_shortage=False)
+            check_destination_space(config, storage, inventory, fail_on_shortage=False)
             return
 
         if mode == "download":
             check_destination_space(
-                config,
-                inventory,
+                config, storage, inventory,
                 fail_on_shortage=config_value(config, "FAIL_IF_NOT_ENOUGH_SPACE", True),
             )
-            summary = download_inventory(config, client, inventory)
+            summary = download_inventory(config, client, inventory, storage)
             print_download_summary(summary)
             return
 
@@ -253,7 +254,7 @@ def clear_meeting_uuid(conn, meeting_uuid):
     conn.commit()
 
 
-def run_retry_not_ready(config, client, conn):
+def run_retry_not_ready(config, client, conn, storage):
     meeting_uuids = read_logged_meeting_uuids(conn)
     if not meeting_uuids:
         utils.print_bright("No not-ready meeting UUIDs are logged.")
@@ -262,14 +263,13 @@ def run_retry_not_ready(config, client, conn):
     meetings = get_meetings(
         client, meeting_uuids, conn=conn, log_failures=True, clear_success=False
     )
-    inventory = build_inventory_from_meetings(config, meetings)
+    inventory = build_inventory_from_meetings(config, meetings, storage=storage)
     print_inventory_summary(inventory)
     check_destination_space(
-        config,
-        inventory,
+        config, storage, inventory,
         fail_on_shortage=config_value(config, "FAIL_IF_NOT_ENOUGH_SPACE", True),
     )
-    summary = download_inventory(config, client, inventory)
+    summary = download_inventory(config, client, inventory, storage)
 
     fetched_uuids = {meeting["_requested_uuid"] for meeting in meetings}
     for meeting_uuid in fetched_uuids - summary.failed_meeting_uuids:
@@ -323,7 +323,7 @@ def date_to_str(date):
     return date.strftime("%Y-%m-%d")
 
 
-def build_inventory(config, client, conn, from_date, to_date):
+def build_inventory(config, client, conn, from_date, to_date, storage):
     all_files = []
     meeting_count = 0
     skipped_missing_size_count = 0
@@ -338,7 +338,7 @@ def build_inventory(config, client, conn, from_date, to_date):
         meeting_uuids = get_meeting_uuids(client, user_email, from_date, to_date)
         meetings = get_meetings(client, meeting_uuids, conn=conn)
         inventory = build_inventory_from_meetings(
-            config, meetings, host_folder=get_user_host_folder(config, user_email)
+            config, meetings, host_folder=get_user_host_folder(config, user_email), storage=storage
         )
         all_files.extend(inventory.files)
         meeting_count += inventory.meeting_count
@@ -414,7 +414,9 @@ def get_meetings(client, meeting_uuids, conn=None, log_failures=True, clear_succ
     return meetings
 
 
-def build_inventory_from_meetings(config, meetings, host_folder=None):
+def build_inventory_from_meetings(config, meetings, host_folder=None, storage=None):
+    if storage is None:
+        storage = LocalStorage()
     files = []
     skipped_missing_size_count = 0
 
@@ -438,7 +440,7 @@ def build_inventory_from_meetings(config, meetings, host_folder=None):
             if not recording_file_matches_type_filter(config, recording_file):
                 continue
 
-            files.append(make_inventory_item(config, meeting, recording_file, folder))
+            files.append(make_inventory_item(config, meeting, recording_file, folder, storage))
 
     matched_meetings = {item.meeting_uuid for item in files}
     return RecordingInventory(
@@ -464,7 +466,7 @@ def recording_file_matches_type_filter(config, recording_file):
     )
 
 
-def make_inventory_item(config, meeting, recording_file, host_folder):
+def make_inventory_item(config, meeting, recording_file, host_folder, storage):
     topic = utils.slugify(meeting.get("topic", "untitled"))
     recording_name = utils.slugify(
         f'{topic}__{recording_file.get("recording_start", "unknown-start")}'
@@ -474,11 +476,11 @@ def make_inventory_item(config, meeting, recording_file, host_folder):
         config, host_folder, file_name, topic, recording_name, create_dirs=False
     )
     file_size = int(recording_file["file_size"])
-    local_exists = os.path.exists(destination_path)
+    existing_size = storage.size(destination_path)
+    local_exists = existing_size is not None
     local_size_matches = (
         local_exists
-        and abs(os.path.getsize(destination_path) - file_size)
-        <= config.FILE_SIZE_MISMATCH_TOLERANCE
+        and abs(existing_size - file_size) <= config.FILE_SIZE_MISMATCH_TOLERANCE
     )
 
     return RecordingItem(
@@ -548,8 +550,14 @@ def print_inventory_summary(inventory):
     print()
 
 
-def check_destination_space(config, inventory, fail_on_shortage):
-    status = get_space_status(config, inventory)
+def check_destination_space(config, storage, inventory, fail_on_shortage):
+    free_bytes = storage.free_space(config.OUTPUT_PATH)
+    if free_bytes is None:
+        utils.print_bright("Object storage destination; skipping disk-space check.")
+        print()
+        return None
+
+    status = get_space_status(config, inventory, free_bytes)
     print_destination_space_status(status)
     if fail_on_shortage and not status.has_enough_space:
         raise RuntimeError(
@@ -560,14 +568,12 @@ def check_destination_space(config, inventory, fail_on_shortage):
     return status
 
 
-def get_space_status(config, inventory):
-    usage_path = utils.find_existing_parent(config.OUTPUT_PATH)
-    free_bytes = shutil.disk_usage(usage_path).free
+def get_space_status(config, inventory, free_bytes):
     reserve_bytes = config.MINIMUM_FREE_DISK
     additional_bytes = inventory.additional_size
     required_bytes = additional_bytes + reserve_bytes
     return SpaceStatus(
-        usage_path=usage_path,
+        usage_path=config.OUTPUT_PATH,
         free_bytes=free_bytes,
         required_bytes=required_bytes,
         additional_bytes=additional_bytes,
@@ -589,12 +595,12 @@ def print_destination_space_status(status):
     print()
 
 
-def download_inventory(config, client, inventory):
+def download_inventory(config, client, inventory, storage):
     summary = DownloadSummary()
 
     for item in inventory.files:
         try:
-            result = download_recording_item(config, client, item)
+            result = download_recording_item(config, client, item, storage)
         except Exception as error:
             summary.failed_count += 1
             summary.failed_meeting_uuids.add(item.meeting_uuid)
@@ -612,7 +618,7 @@ def download_inventory(config, client, inventory):
     return summary
 
 
-def download_recording_item(config, client, item):
+def download_recording_item(config, client, item, storage, show_progress=True):
     if config.VERBOSE_OUTPUT:
         print()
         utils.print_dim(f"URL: {utils.redact_url(item.download_url)}")
@@ -623,24 +629,24 @@ def download_recording_item(config, client, item):
 
     if item.local_exists:
         utils.print_dim_red(f"Deleting corrupt file: {item.file_name}")
-        os.remove(item.destination_path)
+        storage.remove(item.destination_path)
 
     utils.print_bright(f"Downloading: {item.file_name}")
-    os.makedirs(os.path.dirname(item.destination_path), exist_ok=True)
-    utils.wait_for_disk_space(
-        item.file_size, config.OUTPUT_PATH, config.MINIMUM_FREE_DISK, interval=5
-    )
-    tmp_file_path = item.destination_path + ".tmp"
+    if storage.free_space(config.OUTPUT_PATH) is not None:
+        utils.wait_for_disk_space(
+            item.file_size, config.OUTPUT_PATH, config.MINIMUM_FREE_DISK, interval=5
+        )
 
     if download_with_retry(
         client,
+        storage,
         item.download_url,
-        tmp_file_path,
+        item.destination_path,
         item.file_size,
         config.VERBOSE_OUTPUT,
         config.FILE_SIZE_MISMATCH_TOLERANCE,
+        show_progress,
     ):
-        os.rename(tmp_file_path, item.destination_path)
         return True
 
     raise RuntimeError("Max retries reached, download failed.")
@@ -648,23 +654,26 @@ def download_recording_item(config, client, item):
 
 def download_with_retry(
     client,
+    storage,
     download_url,
-    tmp_file_path,
+    dest_path,
     file_size,
     verbose_output,
     file_size_mismatch_tolerance,
+    show_progress,
     max_retries=10,
 ):
     retries = 0
     while retries < max_retries:
         try:
             response = client.request("GET", download_url, stream=True)
-            utils.download_response_with_progress(
+            storage.save_stream(
                 response,
-                tmp_file_path,
+                dest_path,
                 file_size,
                 verbose_output,
                 file_size_mismatch_tolerance,
+                show_progress=show_progress,
             )
             return True
         except Exception as error:
