@@ -1,17 +1,21 @@
-# zoom-batch-downloader
+# micro1-zoom-downloader
 
-Download, estimate, and safely delete Zoom cloud recordings for accounts with
-[paid plans](https://zoom.us/pricing#personal).
+A [micro1](https://micro1.ai) tool to download, estimate, and safely delete Zoom
+cloud recordings in bulk for accounts on [paid plans](https://zoom.us/pricing#personal).
 
-This script uses Zoom Server-to-Server OAuth. Create a
+Point it at a date range (and optionally specific users, topics, or file types),
+run a safe estimate to see exactly what will be pulled and how much disk it needs,
+then download. Delete modes are dry-run by default and never touch your local files.
+
+This tool uses Zoom Server-to-Server OAuth. Create a
 [Server-to-Server OAuth app](https://developers.zoom.us/docs/internal-apps/create/)
 in the [Zoom App Marketplace](https://marketplace.zoom.us/user/build), then copy
 that app's credentials into `config.py`.
 
 ## Authentication
 
-You do not paste a Zoom access token into this project. The script requests
-short-lived access tokens automatically from Zoom by using the three app
+You do not paste a Zoom access token into this project. The tool requests
+short-lived access tokens automatically from Zoom using the three app
 credentials in `config.py`:
 
 ```python
@@ -35,13 +39,13 @@ app's scopes first, then confirm the three credential values above.
 
 ## Required Zoom app scopes
 
-Configure these scopes in the Zoom Marketplace app before running the script.
+Configure these scopes in the Zoom Marketplace app before running the tool.
 
 For estimating and downloading recordings:
 
 - `cloud_recording:read:list_user_recordings:admin`
 - `cloud_recording:read:list_recording_files:admin`
-- `user:read:list_users:admin` if `USERS` is empty and the script should scan every account user
+- `user:read:list_users:admin` if `USERS` is empty and the tool should scan every account user
 
 For deletion modes, also add the corresponding cloud-recording delete/write
 scope in your Zoom app. If you use classic scopes, the older equivalents are:
@@ -54,7 +58,12 @@ scope in your Zoom app. If you use classic scopes, the older equivalents are:
 
 1. Create and activate a Server-to-Server OAuth app in Zoom.
 
-2. Clone or download this repository.
+2. Clone this repository.
+
+   ```bash
+   git clone https://github.com/micro1/micro1-zoom-downloader.git
+   cd micro1-zoom-downloader
+   ```
 
 3. Copy `config_template.py` to `config.py`.
 
@@ -66,7 +75,7 @@ scope in your Zoom app. If you use classic scopes, the older equivalents are:
    Zoom app's **App Credentials** page. Then edit the date range, filters, and
    `OUTPUT_PATH`.
 
-5. Install Python 3, create a virtual environment, and install requirements.
+5. Install Python 3.11+, create a virtual environment, and install requirements.
 
    ```bash
    python3 -m venv .venv
@@ -95,6 +104,26 @@ scope in your Zoom app. If you use classic scopes, the older equivalents are:
    python3 zoom_batch_downloader.py
    ```
 
+## Configuration
+
+All behavior is driven by `config.py`. The most common settings:
+
+- `OUTPUT_PATH` — destination folder for downloads.
+- `START_*` / `END_*` — inclusive date range. A `None` day is replaced by the
+  first/last day of the month.
+- `USERS` — emails to scan. If empty, all users under the account are scanned.
+- `TOPICS` — only download recordings whose meeting topic matches. Empty means no
+  topic filtering.
+- `RECORDING_FILE_TYPES` — restrict to specific file types (`MP4`, `M4A`,
+  `TRANSCRIPT`, `CHAT`, etc.). Empty means all types.
+- `GROUP_BY_USER` / `GROUP_BY_TOPIC` / `GROUP_BY_RECORDING` — how downloads are
+  foldered on disk.
+- `INCLUDE_PARTICIPANT_AUDIO` — also download per-participant audio files when
+  available.
+- `MINIMUM_FREE_DISK` / `FAIL_IF_NOT_ENOUGH_SPACE` — disk-space guardrails.
+
+See `config_template.py` for the full, commented list.
+
 ## Modes
 
 Set `MODE` in `config.py`.
@@ -105,12 +134,12 @@ Set `MODE` in `config.py`.
 MODE = "download"
 ```
 
-This is the default. The script scans matching recordings, builds an inventory,
+This is the default. The tool scans matching recordings, builds an inventory,
 checks the destination drive has enough free space for missing files plus
 `MINIMUM_FREE_DISK`, then downloads.
 
 If the destination is short on space and `FAIL_IF_NOT_ENOUGH_SPACE = True`, the
-script exits before downloading anything. If set to `False`, it keeps the older
+tool exits before downloading anything. If set to `False`, it keeps the older
 per-file wait behavior.
 
 ### Estimate
@@ -218,4 +247,16 @@ Permanent deletion cannot be undone through Zoom trash recovery.
   than appending tokens to logged URLs.
 - Error output redacts bearer tokens and token query parameters.
 
-Code written by Georg Kasmin, Lane Campbell, Sami Hassan and Aness Zurba.
+## Development
+
+Install the dev requirements and run the test suite:
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+python3 -m pytest
+```
+
+## Credits
+
+Maintained by [micro1](https://micro1.ai). Originally written by Georg Kasmin,
+Lane Campbell, Sami Hassan, and Aness Zurba.
