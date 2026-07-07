@@ -1,3 +1,4 @@
+import datetime
 import threading
 from types import SimpleNamespace
 
@@ -373,3 +374,22 @@ def test_download_inventory_counts_failures_without_aborting(tmp_path, monkeypat
     assert summary.failed_count == 1
     assert summary.downloaded_count == 1
     assert "m0" in summary.failed_meeting_uuids
+
+
+def test_get_date_range_all_time_uses_floor_and_today(tmp_path):
+    config = make_config(tmp_path, ALL_TIME=True)
+    today = datetime.datetime(2026, 7, 7)
+
+    from_date, to_date = zbd.get_date_range(config, today=today)
+
+    assert from_date == datetime.datetime(2012, 1, 1)
+    assert to_date == today
+
+
+def test_get_date_range_respects_explicit_range_when_not_all_time(tmp_path):
+    config = make_config(tmp_path, ALL_TIME=False)
+
+    from_date, to_date = zbd.get_date_range(config)
+
+    assert from_date == datetime.datetime(2024, 1, 1)
+    assert to_date == datetime.datetime(2024, 1, 31)

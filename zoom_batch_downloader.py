@@ -218,7 +218,16 @@ def print_filter_warnings(config):
         print()
 
 
-def get_date_range(config):
+def get_date_range(config, today=None):
+    if config_value(config, "ALL_TIME", False):
+        from_date = datetime.datetime(
+            config_value(config, "ALL_TIME_START_YEAR", 2012),
+            config_value(config, "ALL_TIME_START_MONTH", 1),
+            config_value(config, "ALL_TIME_START_DAY", 1),
+        )
+        to_date = today or datetime.datetime.now()
+        return from_date, to_date
+
     from_date = datetime.datetime(
         config.START_YEAR, config.START_MONTH, config.START_DAY or 1
     )
