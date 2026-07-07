@@ -168,7 +168,7 @@ def redact_sensitive_text(text):
 	text = re.sub(r"(Bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", text)
 	return text
 
-def download_response_with_progress(response, output_path, expected_size, verbose_output, size_tolerance):
+def download_response_with_progress(response, output_path, expected_size, verbose_output, size_tolerance, show_progress=True):
 	class download_progress_bar(tqdm):
 		def __init__(self, expected_size=None, dynamic_ncols=True):
 			r_bar = '| {n_fmt}{unit}/{total_fmt}{unit} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
@@ -184,45 +184,44 @@ def download_response_with_progress(response, output_path, expected_size, verbos
 				self.total = tsize
 			self.update(b * bsize - self.n)
 
-
-	with download_progress_bar(expected_size=expected_size) as t:
-		try:
-			with open(output_path, "wb") as output_file:
+	try:
+		with open(output_path, "wb") as output_file:
+			bar = download_progress_bar(expected_size=expected_size) if show_progress else None
+			try:
 				for chunk in response.iter_content(chunk_size=1024 * 1024):
 					if not chunk:
 						continue
 					output_file.write(chunk)
-					t.update(len(chunk))
+					if bar is not None:
+						bar.update(len(chunk))
+			finally:
+				if bar is not None:
+					bar.close()
 
-			file_size = os.path.getsize(output_path)
-			if abs(file_size - expected_size) > size_tolerance:
-				t.update_to(bsize=0, tsize=expected_size)
-				if verbose_output:
-					print_dim_red(
-						f'Size mismatch: Expected {expected_size} bytes but got {file_size}. '
-			   			f'Size difference: {size_to_string(abs(file_size - expected_size))}.\n'
-						f'You might want to increase FILE_SIZE_MISMATCH_TOLERANCE in config.py'
-					)
-				raise Exception(
-					"Failed to download file."
-					f'{"" if verbose_output else " Enable verbose output for more details."}'
-				)
-			
-			t.update_to(bsize=file_size, tsize=file_size)
-			t.close()
-
-			if file_size != expected_size and verbose_output:
+		file_size = os.path.getsize(output_path)
+		if abs(file_size - expected_size) > size_tolerance:
+			if verbose_output:
 				print_dim_red(
-					f'Size mismatch within tolerance: Expected {expected_size} bytes but got {file_size}. '
-					f'Size difference: {size_to_string(abs(file_size - expected_size))}.'
+					f'Size mismatch: Expected {expected_size} bytes but got {file_size}. '
+					f'Size difference: {size_to_string(abs(file_size - expected_size))}.\n'
+					f'You might want to increase FILE_SIZE_MISMATCH_TOLERANCE in config.py'
 				)
-		except:
-			try:
-				os.remove(output_path)
-			except OSError:
-				pass
-			
-			raise
+			raise Exception(
+				"Failed to download file."
+				f'{"" if verbose_output else " Enable verbose output for more details."}'
+			)
+
+		if file_size != expected_size and verbose_output:
+			print_dim_red(
+				f'Size mismatch within tolerance: Expected {expected_size} bytes but got {file_size}. '
+				f'Size difference: {size_to_string(abs(file_size - expected_size))}.'
+			)
+	except:
+		try:
+			os.remove(output_path)
+		except OSError:
+			pass
+		raise
 
 def is_debug() -> bool:
     """Return if the debugger is currently active"""
