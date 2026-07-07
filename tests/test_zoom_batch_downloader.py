@@ -305,6 +305,15 @@ def test_redacts_access_tokens_from_text_and_urls():
     assert "secret-token" not in utils.redact_url(text.split()[0])
 
 
+def test_redacts_azure_secrets():
+    conn = ("DefaultEndpointsProtocol=https;AccountName=acct;"
+            "AccountKey=SUPERSECRETKEY==;EndpointSuffix=core.windows.net")
+    sas = "https://acct.blob.core.windows.net/c/blob?sig=SECRETSIG&sv=2021"
+
+    assert "SUPERSECRETKEY" not in utils.redact_sensitive_text(conn)
+    assert "SECRETSIG" not in utils.redact_sensitive_text(sas)
+
+
 class RecordingDownloadClient:
     """Records concurrent download calls and serves fixed content."""
 

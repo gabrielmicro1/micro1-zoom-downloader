@@ -124,6 +124,27 @@ All behavior is driven by `config.py`. The most common settings:
 
 See `config_template.py` for the full, commented list.
 
+### Scale & destination settings
+
+- `STORAGE_BACKEND` — `"local"` (default) writes to `OUTPUT_PATH` on disk;
+  `"azure"` streams downloads directly to Azure Blob Storage instead.
+- `AZURE_STORAGE_CONNECTION_STRING` / `AZURE_STORAGE_ACCOUNT_URL` /
+  `AZURE_CONTAINER` / `AZURE_PREFIX` — used only when `STORAGE_BACKEND =
+  "azure"`. Provide either a connection string or an account URL (with an
+  appropriate credential/SAS in the URL), plus the target container and an
+  optional prefix (virtual folder) prepended to every blob name. The
+  `azure-storage-blob` package is only required when using this backend.
+  Azure destinations also skip the local disk-space preflight check, since
+  there is no local disk being written to.
+- `CONCURRENCY` — number of concurrent download workers. Raise if your Zoom
+  plan's rate limits allow.
+- `REQUESTS_PER_SECOND` — global cap on Zoom API requests per second, shared
+  across all workers.
+- `MAX_RATE_LIMIT_RETRIES` — how many times to retry a single request after a
+  429 (rate limit) response before giving up.
+- `ALL_TIME` — if `True`, ignore `START_*`/`END_*` and scan from
+  `ALL_TIME_START_YEAR`/`_MONTH`/`_DAY` through today.
+
 ## Modes
 
 Set `MODE` in `config.py`.

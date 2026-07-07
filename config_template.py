@@ -4,6 +4,35 @@ CLIENT_ID = R"##########"
 CLIENT_SECRET = R"##########"
 
 
+# --- Scale & destination settings ---
+
+# Where downloads land: "local" writes to OUTPUT_PATH on disk; "azure" streams to Azure Blob Storage.
+STORAGE_BACKEND = "local"
+
+# Azure Blob settings (used only when STORAGE_BACKEND = "azure").
+# Provide either a connection string, or an account URL (with an appropriate credential/SAS in the URL).
+AZURE_STORAGE_CONNECTION_STRING = R""
+AZURE_STORAGE_ACCOUNT_URL = R""
+AZURE_CONTAINER = R""
+# Optional prefix (virtual folder) prepended to every blob name.
+AZURE_PREFIX = R""
+
+# Number of concurrent download workers. Raise if your Zoom plan's rate limits allow.
+CONCURRENCY = 8
+
+# Global cap on Zoom API requests per second, shared across all workers.
+REQUESTS_PER_SECOND = 8
+
+# How many times to retry a single request after a 429 (rate limit) before giving up.
+MAX_RATE_LIMIT_RETRIES = 8
+
+# If True, ignore the START_*/END_* range and scan from ALL_TIME_START to today.
+ALL_TIME = False
+ALL_TIME_START_YEAR = 2012
+ALL_TIME_START_MONTH = 1
+ALL_TIME_START_DAY = 1
+
+
 # Tool mode.
 # - "download": scan, check destination free space, and download matched recordings.
 # - "estimate": scan and report size/free-space requirements without downloading.

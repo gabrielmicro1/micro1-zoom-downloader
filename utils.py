@@ -166,6 +166,8 @@ def redact_sensitive_text(text):
 	text = re.sub(r"access_token=([^&\s]+)", "access_token=[REDACTED]", text)
 	text = re.sub(r"token=([^&\s]+)", "token=[REDACTED]", text)
 	text = re.sub(r"(Bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", text)
+	text = re.sub(r"AccountKey=[^;]+", "AccountKey=[REDACTED]", text)
+	text = re.sub(r"(sig=)[^&\s;]+", r"\1[REDACTED]", text, flags=re.IGNORECASE)
 	return text
 
 def download_response_with_progress(response, output_path, expected_size, verbose_output, size_tolerance, show_progress=True):
