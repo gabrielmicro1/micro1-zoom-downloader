@@ -1,0 +1,2 @@
+# Install with: pip install -r requirements-azure.txt  — only needed when STORAGE_BACKEND = "azure"
+azure-storage-blob>=12.19.0

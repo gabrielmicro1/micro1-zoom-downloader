@@ -133,7 +133,10 @@ See `config_template.py` for the full, commented list.
   "azure"`. Provide either a connection string or an account URL (with an
   appropriate credential/SAS in the URL), plus the target container and an
   optional prefix (virtual folder) prepended to every blob name. The
-  `azure-storage-blob` package is only required when using this backend.
+  `azure-storage-blob` package is only required when using this backend and is
+  not installed by `requirements.txt`; install it separately with
+  `pip install -r requirements-azure.txt` before using
+  `STORAGE_BACKEND = "azure"`.
   Azure destinations also skip the local disk-space preflight check, since
   there is no local disk being written to.
 - `CONCURRENCY` — number of concurrent download workers. Raise if your Zoom

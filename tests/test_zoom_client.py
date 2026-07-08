@@ -1,3 +1,5 @@
+import threading
+
 import responses
 
 from zoom_client import RateLimiter, zoom_client
@@ -107,3 +109,52 @@ def test_backoff_uses_exponential_when_no_retry_after():
 
     assert client.get("/users/me") == {"id": "me"}
     assert sleeps == [1.0, 2.0]  # 2**0, 2**1
+
+
+@responses.activate
+def test_concurrent_cold_start_requests_share_a_single_token_fetch():
+    # Locks in the single-flight guarantee: many threads racing to make the
+    # very first request (cached_token is None) must only trigger one
+    # POST /oauth/token, not one per thread.
+    responses.add(
+        responses.POST,
+        "https://api.zoom.us/oauth/token",
+        json={"access_token": "token-one"},
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        "https://api.zoom.us/v2/users/me",
+        json={"id": "me"},
+        status=200,
+    )
+
+    client = zoom_client("acct", "client", "secret", sleep=lambda seconds: None)
+    assert client.cached_token is None
+
+    thread_count = 20
+    barrier = threading.Barrier(thread_count)
+    results = []
+    errors = []
+
+    def worker():
+        barrier.wait()  # line every thread up so they hit _get_token together
+        try:
+            results.append(client.get("/users/me"))
+        except Exception as error:  # pragma: no cover - surfaced via assertion below
+            errors.append(error)
+
+    threads = [threading.Thread(target=worker) for _ in range(thread_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert results == [{"id": "me"}] * thread_count
+
+    token_calls = [
+        call for call in responses.calls
+        if call.request.url == "https://api.zoom.us/oauth/token"
+    ]
+    assert len(token_calls) == 1

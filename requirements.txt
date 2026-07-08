@@ -1,4 +1,5 @@
 colorama==0.4.6
 requests>=2.32.4
 tqdm==4.66.3
-azure-storage-blob>=12.19.0
+# azure-storage-blob is only needed when STORAGE_BACKEND = "azure".
+# Install it with: pip install -r requirements-azure.txt

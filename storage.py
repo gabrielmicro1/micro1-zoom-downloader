@@ -41,7 +41,9 @@ class LocalStorage(Storage):
             os.remove(path)
 
     def save_stream(self, response, dest_path, expected_size, verbose_output, size_tolerance, show_progress=True):
-        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        parent = os.path.dirname(dest_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         tmp_path = dest_path + ".tmp"
         utils.download_response_with_progress(
             response, tmp_path, expected_size, verbose_output, size_tolerance, show_progress=show_progress

@@ -4,10 +4,8 @@ import datetime
 import importlib
 import math
 import os
-import shutil
 import sqlite3
 import sys
-import threading
 import time
 import traceback
 from calendar import monthrange
@@ -646,14 +644,17 @@ def download_recording_item(config, client, item, storage, show_progress=True):
         utils.print_dim(f"URL: {utils.redact_url(item.download_url)}")
 
     if item.local_size_matches:
-        utils.print_dim(f"Skipping existing file: {item.file_name}")
+        if show_progress:
+            utils.print_dim(f"Skipping existing file: {item.file_name}")
         return False
 
     if item.local_exists:
-        utils.print_dim_red(f"Deleting corrupt file: {item.file_name}")
+        if show_progress:
+            utils.print_dim_red(f"Deleting corrupt file: {item.file_name}")
         storage.remove(item.destination_path)
 
-    utils.print_bright(f"Downloading: {item.file_name}")
+    if show_progress:
+        utils.print_bright(f"Downloading: {item.file_name}")
     if storage.free_space(config.OUTPUT_PATH) is not None:
         utils.wait_for_disk_space(
             item.file_size, config.OUTPUT_PATH, config.MINIMUM_FREE_DISK, interval=5
@@ -700,9 +701,11 @@ def download_with_retry(
             return True
         except Exception as error:
             retries += 1
-            print(f"Download failed: {utils.redact_sensitive_text(error)}")
+            if show_progress:
+                print(f"Download failed: {utils.redact_sensitive_text(error)}")
             if retries < max_retries:
-                print(f"Retrying ({retries}/{max_retries}) in 5 seconds...")
+                if show_progress:
+                    print(f"Retrying ({retries}/{max_retries}) in 5 seconds...")
                 time.sleep(5)
     return False
 
